@@ -327,6 +327,18 @@ def transcribe(video: Path, workdir: Path, model_size: str | None) -> list[Word]
     return words
 
 
+def merge_contractions(words: list[Word]) -> list[Word]:
+    """Rejoin tokens Whisper splits at apostrophes ("s" + "'est" -> "s'est")."""
+    merged: list[Word] = []
+    for w in words:
+        if merged and (w.text[:1] in "'’" or merged[-1].text[-1:] in "'’"):
+            prev = merged[-1]
+            merged[-1] = Word(prev.start, max(prev.end, w.end), prev.text + w.text)
+        else:
+            merged.append(w)
+    return merged
+
+
 def load_words_json(path: Path, min_prob: float = 0.0) -> list[Word]:
     data = json.loads(path.read_text(encoding="utf-8"))
     return [Word(float(w["start"]), float(w["end"]), str(w["text"]).strip())
@@ -1097,6 +1109,8 @@ def process(args: argparse.Namespace) -> SessionResult:
             if precrop:
                 log(f"black bars detected, cropping to {precrop.rstrip(',')}")
 
+            words = merge_contractions(words)
+
             # 4. choose moments
             min_s, max_s = args.min_seconds, args.max_seconds
             if total and total < min_s * args.count:
@@ -1107,7 +1121,16 @@ def process(args: argparse.Namespace) -> SessionResult:
             if has_audio and (args.mode == "music" or args.style == "vibe"):
                 audio = audio_analysis(src)
                 log(f"audio analysis: {len(audio['beats'])} strong beats detected")
-            if args.mode == "music" and audio is not None:
+            if args.segments:
+                for i, part in enumerate(args.segments.split(","), 1):
+                    a, b = (float(x) for x in part.strip().split("-"))
+                    b = min(b, total or b)
+                    if b - a < 1:
+                        raise ValueError(f"segment {part!r} is too short or reversed")
+                    plans.append(ClipPlan(i, a, b, 0.0, " ".join(
+                        w.text for w in words if a <= w.start < b)))
+                result.selection_method = f"editor-chosen segments ({args.segments})"
+            if not plans and args.mode == "music" and audio is not None:
                 plans = music_select(words, args.count, min_s, max_s, total, audio)
                 result.selection_method = ("music mode: loudness, repeated lyric lines "
                                            "(chorus/hook), beat density")
@@ -1210,6 +1233,8 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     p.add_argument("--style", choices=["clean", "vibe"], default="clean",
                    help="vibe = colour grade, beat-synced zoom pulses, flash-in, fade-out, "
                         "progress bar")
+    p.add_argument("--segments",
+                   help='explicit moments in seconds, e.g. "169.9-197.3,2.7-23.9" (overrides picking)')
     p.add_argument("--hook-text", help="big title shown for the first 2.6 seconds")
     p.add_argument("--min-word-prob", type=float, default=0.0,
                    help="drop transcript words below this whisper confidence (lyrics)")
