@@ -44,6 +44,8 @@ dependencies = [
     "filelock>=4.2.1,<5",
     # 阿拉伯字母字幕的整形与绘制（HarfBuzz + FreeType，wheel 自带，无需系统库）。
     "khatt[video]==0.4.0",
+    # 病毒式短视频剪辑器（app.services.viral_clipper）下载在线视频。
+    "yt-dlp>=2025.1.1",
 ]
 
 [project.scripts]
