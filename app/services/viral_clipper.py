@@ -63,6 +63,7 @@ PLATFORM_HOSTS = {
     "dailymotion.com": "Dailymotion",
     "kick.com": "Kick",
     "rumble.com": "Rumble",
+    "ted.com": "TED",
 }
 
 SENSITIVE_QUERY_KEYS = re.compile(
@@ -582,8 +583,8 @@ def filter_graph(layout: str, ass_name: str | None, fonts_rel: str) -> str:
             "[0:v]split=2[a][b];"
             f"[a]scale={OUT_W}:{half}:force_original_aspect_ratio=increase,"
             f"crop={OUT_W}:{half},setsar=1[top];"
-            # Bottom panel: tighter punch-in on the centre (speaker/action) for contrast.
-            f"[b]crop=iw/1.8:ih/1.8:(iw-iw/1.8)/2:(ih-ih/1.8)/2.6,"
+            # Bottom panel: tighter punch-in, biased upward so heads in wide shots stay in frame.
+            f"[b]crop=iw/1.8:ih/1.8:(iw-iw/1.8)/2:(ih-ih/1.8)/5,"
             f"scale={OUT_W}:{half}:force_original_aspect_ratio=increase,"
             f"crop={OUT_W}:{half},setsar=1[bot];"
             "[top][bot]vstack=inputs=2,"
