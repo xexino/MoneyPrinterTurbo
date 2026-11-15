@@ -327,10 +327,11 @@ def transcribe(video: Path, workdir: Path, model_size: str | None) -> list[Word]
     return words
 
 
-def load_words_json(path: Path) -> list[Word]:
+def load_words_json(path: Path, min_prob: float = 0.0) -> list[Word]:
     data = json.loads(path.read_text(encoding="utf-8"))
     return [Word(float(w["start"]), float(w["end"]), str(w["text"]).strip())
-            for w in data if str(w.get("text", "")).strip()]
+            for w in data if str(w.get("text", "")).strip()
+            and float(w.get("p", 1.0)) >= min_prob]
 
 
 # ---------------------------------------------------------------- clip selection
@@ -424,6 +425,116 @@ def even_windows(words: list[Word], count: int, min_s: float, max_s: float,
         text = " ".join(w.text for w in words if start <= w.start < end)
         plans.append(ClipPlan(len(plans) + 1, start, end, 0.0, text))
     return plans
+
+
+# ------------------------------------------------------------ music analysis
+
+
+def audio_analysis(src: Path, sr: int = 11025, hop: int = 256) -> dict:
+    """Beat onsets and loudness curve of the source audio (numpy only).
+
+    Returns {"beats": [seconds of strong onsets], "energy": per-frame RMS, "fps": frames/s}.
+    """
+    import numpy as np
+
+    raw = subprocess.run(
+        [ffmpeg_bin(), "-v", "error", "-i", str(src), "-vn", "-ac", "1", "-ar", str(sr),
+         "-f", "s16le", "-"], capture_output=True).stdout
+    x = np.frombuffer(raw, np.int16).astype(np.float32) / 32768.0
+    n = max(0, (len(x) - 512) // hop)
+    if n < 10:
+        return {"beats": [], "energy": np.zeros(1), "fps": sr / hop}
+    idx = np.arange(512)[None, :] + hop * np.arange(n)[:, None]
+    frames = x[idx] * np.hanning(512)[None, :]
+    spec = np.abs(np.fft.rfft(frames, axis=1))
+    freqs = np.fft.rfftfreq(512, 1 / sr)
+    fps = sr / hop
+    energy = np.sqrt((frames ** 2).mean(axis=1))
+    logspec = np.log1p(spec * 10)
+    flux_full = np.maximum(0, np.diff(logspec, axis=0, prepend=logspec[:1])).sum(axis=1)
+    low = freqs < 160  # kick drum / 808 band
+    flux_low = np.maximum(0, np.diff(logspec[:, low], axis=0, prepend=logspec[:1, low])).sum(axis=1)
+    flux = flux_low / (flux_low.max() + 1e-9) * 0.65 + flux_full / (flux_full.max() + 1e-9) * 0.35
+    w = int(fps)  # 1 s adaptive threshold
+    kernel = np.ones(w) / w
+    mean = np.convolve(flux, kernel, mode="same")
+    std = np.sqrt(np.maximum(0, np.convolve(flux ** 2, kernel, mode="same") - mean ** 2))
+    thr = mean + 1.4 * std
+    min_gap = int(0.28 * fps)
+    peaks, last = [], -min_gap
+    for i in range(2, len(flux) - 2):
+        if flux[i] > thr[i] and flux[i] == flux[max(0, i - 3):i + 4].max() and i - last >= min_gap:
+            peaks.append(i)
+            last = i
+    if peaks:
+        vals = flux[peaks]
+        cut = np.quantile(vals, 0.45)
+        peaks = [p for p, v in zip(peaks, vals) if v >= cut]
+    return {"beats": [round(p / fps, 3) for p in peaks], "energy": energy, "fps": fps}
+
+
+def _norm_line(words: list[Word]) -> str:
+    return " ".join(tokenize(" ".join(w.text for w in words)))
+
+
+def music_select(words: list[Word], count: int, min_s: float, max_s: float, total: float,
+                 audio: dict) -> list[ClipPlan]:
+    """Pick hook/chorus moments: loud sections, repeated lyric lines, dense beats."""
+    import numpy as np
+
+    energy, fps = audio["energy"], audio["fps"]
+    mu, sd = float(energy.mean()), float(energy.std() + 1e-9)
+    beats = np.array(audio["beats"] or [0.0])
+
+    def window_energy(a: float, b: float) -> float:
+        seg = energy[int(a * fps):max(int(a * fps) + 1, int(b * fps))]
+        return (float(seg.mean()) - mu) / sd if len(seg) else 0.0
+
+    def beat_density(a: float, b: float) -> float:
+        return float(((beats >= a) & (beats < b)).sum()) / max(1.0, b - a)
+
+    candidates: list[tuple[float, float, float, str, set]] = []
+    sents = sentences_from_words(words) if words else []
+    if sents:
+        lines = [_norm_line(s) for s in sents]
+        freq: dict[str, int] = {}
+        for ln in lines:
+            if ln:
+                freq[ln] = freq.get(ln, 0) + 1
+        for i in range(len(sents)):
+            for j in range(i, len(sents)):
+                a, b = sents[i][0].start, sents[j][-1].end
+                if b - a > max_s:
+                    break
+                if b - a < min_s:
+                    continue
+                wl = [w for s in sents[i:j + 1] for w in s]
+                rep_words = sum(len(s) for s, ln in zip(sents[i:j + 1], lines[i:j + 1])
+                                if freq.get(ln, 0) >= 2)
+                score = (2.0 * window_energy(a, b) + 3.0 * rep_words / max(1, len(wl))
+                         + 0.6 * beat_density(a, b) + 0.2 * len(wl) / (b - a))
+                text = " ".join(w.text for w in wl)
+                candidates.append((score, max(0.0, a - 0.2), min(total or b + 0.5, b + 0.5),
+                                   text, set(tokenize(text))))
+    if not candidates:  # instrumental or no transcript: loudest sliding windows
+        length = (min_s + max_s) / 2
+        t = 0.0
+        while t + length <= (total or 0):
+            candidates.append((2.0 * window_energy(t, t + length) + 0.6 * beat_density(t, t + length),
+                               t, t + length, "", set()))
+            t += 1.0
+    candidates.sort(key=lambda c: -c[0])
+    chosen: list[tuple] = []
+    for c in candidates:
+        overlap = any(not (c[2] <= o[1] or c[1] >= o[2]) for o in chosen)
+        # Choruses repeat: skip windows whose lyrics mostly duplicate an earlier pick.
+        dup = any(c[4] and o[4] and len(c[4] & o[4]) / len(c[4] | o[4]) > 0.45 for o in chosen)
+        if not overlap and not dup:
+            chosen.append(c)
+        if len(chosen) == count:
+            break
+    chosen.sort(key=lambda c: c[1])
+    return [ClipPlan(i, c[1], c[2], round(c[0], 3), c[3]) for i, c in enumerate(chosen, 1)]
 
 
 def llm_available() -> bool:
@@ -522,7 +633,7 @@ def chunk_words(words: list[Word], max_words: int = 3, max_chars: int = 18) -> l
     return chunks
 
 
-def build_ass(words: list[Word], layout: str, path: Path) -> int:
+def build_ass(words: list[Word], layout: str, path: Path, hook_text: str = "") -> int:
     """Write an ASS file with word-by-word yellow captions and a spring pop.
 
     Each word gets its own event; the active word overshoots (60% -> 125% -> 92% ->
@@ -543,6 +654,7 @@ ScaledBorderAndShadow: yes
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
 Style: Viral,{SUB_FONT},{font_size},{SUB_COLOR_ASS},{SUB_COLOR_ASS},&H00000000,&H96000000,-1,0,0,0,100,100,1,0,1,7,3,{alignment},60,60,{margin_v},1
+Style: Hook,{SUB_FONT},{78 if layout == "full" else 70},&H00FFFFFF,&H00FFFFFF,&H00000000,&H96000000,-1,0,0,0,100,100,2,0,1,8,4,8,70,70,{230 if layout == "full" else 110},1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -551,6 +663,11 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
               r"\t(140,210,\fscx100\fscy100)}")
     settle = r"{\fscx100\fscy100}"
     events = []
+    if hook_text:
+        events.append(
+            "Dialogue: 1,0:00:00.00,0:00:02.60,Hook,,0,0,0,,"
+            r"{\fad(120,300)\fscx70\fscy70\t(0,110,\fscx112\fscy112)\t(110,220,\fscx100\fscy100)}"
+            + ass_escape(hook_text.upper()))
     chunks = chunk_words(words)
     for ci, chunk in enumerate(chunks):
         next_start = chunks[ci + 1][0].start if ci + 1 < len(chunks) else None
@@ -576,11 +693,60 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 # ------------------------------------------------------------------------ render
 
 
-def filter_graph(layout: str, ass_name: str | None, fonts_rel: str) -> str:
+def detect_letterbox(src: Path, duration: float) -> str:
+    """Return an ffmpeg crop filter removing black bars, or "" when there are none."""
+    found: dict[str, int] = {}
+    points = [duration * f for f in (0.2, 0.4, 0.6, 0.8)] if duration > 20 else [1.0]
+    for t in points:
+        proc = subprocess.run(
+            [ffmpeg_bin(), "-hide_banner", "-ss", f"{t:.2f}", "-i", str(src), "-t", "2",
+             "-vf", "cropdetect=limit=24:round=2:reset=0", "-f", "null", "-"],
+            capture_output=True, text=True, errors="replace")
+        hits = re.findall(r"crop=(\d+):(\d+):(\d+):(\d+)", proc.stderr)
+        if hits:
+            key = ":".join(hits[-1])
+            found[key] = found.get(key, 0) + 1
+    if not found:
+        return ""
+    # Use the largest detected area so a dark scene never over-crops the image.
+    w, h, x, y = max((tuple(map(int, k.split(":"))) for k in found), key=lambda c: c[0] * c[1])
+    info = probe(src)
+    v = next((st for st in info.get("streams", []) if st.get("codec_type") == "video"), {})
+    if (w, h) == (int(v.get("width", 0)), int(v.get("height", 0))) or w < 64 or h < 64:
+        return ""
+    return f"crop={w}:{h}:{x}:{y},"
+
+
+def vibe_filters(duration: float, beats: list[float]) -> tuple[str, str]:
+    """Colour grade, beat-synced zoom pulses, flash-in, fade-out and a progress bar."""
+    terms = "+".join(f"exp(-11*(t-{b:.3f}))*gte(t,{b:.3f})" for b in beats[:90]) or "0"
+    z = f"(1+min(0.075*({terms}),0.11))"
+    pre = (
+        ",eq=contrast=1.12:saturation=1.32:brightness=-0.012:gamma=0.97"
+        ",vignette=angle=PI/5"
+        f",scale=w='trunc({OUT_W}*{z}/2)*2':h='trunc({OUT_H}*{z}/2)*2':eval=frame"
+        f",crop={OUT_W}:{OUT_H}"
+    )
+    post = (
+        ",fade=t=in:st=0:d=0.28:color=white"
+        f",fade=t=out:st={max(0.0, duration - 0.55):.3f}:d=0.55"
+    )
+    return pre, post
+
+
+def progress_bar(duration: float) -> str:
+    """Filtergraph tail: a #FFD700 bar sliding in from the left over the clip's length."""
+    return (f"[pre];color=c=0xFFD700:s={OUT_W}x14:r={OUT_FPS}:d={duration:.3f}[bar];"
+            f"[pre][bar]overlay=x='-w+W*t/{duration:.3f}':y=H-h:eval=frame:eof_action=pass")
+
+
+def filter_graph(layout: str, ass_name: str | None, fonts_rel: str,
+                 vibe: tuple[str, str] | None = None, precrop: str = "",
+                 duration: float = 0.0) -> str:
     if layout == "split":
         half = OUT_H // 2
         graph = (
-            "[0:v]split=2[a][b];"
+            f"[0:v]{precrop}split=2[a][b];"
             f"[a]scale={OUT_W}:{half}:force_original_aspect_ratio=increase,"
             f"crop={OUT_W}:{half},setsar=1[top];"
             # Bottom panel: tighter punch-in, biased upward so heads in wide shots stay in frame.
@@ -592,33 +758,47 @@ def filter_graph(layout: str, ass_name: str | None, fonts_rel: str) -> str:
         )
     else:
         graph = (
-            f"[0:v]scale={OUT_W}:{OUT_H}:force_original_aspect_ratio=increase,"
+            f"[0:v]{precrop}scale={OUT_W}:{OUT_H}:force_original_aspect_ratio=increase,"
             f"crop={OUT_W}:{OUT_H},setsar=1"
         )
+    if vibe:
+        graph += vibe[0]
     graph += f",fps={OUT_FPS}"
+    if vibe:
+        graph += vibe[1]
     if ass_name:
         graph += f",ass={ass_name}:fontsdir={fonts_rel}"
+    if vibe and duration > 0:
+        graph += progress_bar(duration)
     return graph + "[v]"
 
 
 def render_clip(src: Path, plan: ClipPlan, layout: str, words: list[Word],
-                out_dir: Path, has_audio: bool) -> tuple[Path, int]:
+                out_dir: Path, has_audio: bool, style: str = "clean",
+                beats: list[float] | None = None, hook_text: str = "",
+                precrop: str = "") -> tuple[Path, int]:
     out = out_dir / f"clip_{plan.index:02d}_{layout}.mp4"
     clip_words = [Word(w.start - plan.start, w.end - plan.start, w.text)
                   for w in words if w.start >= plan.start and w.end <= plan.end + 0.05]
     ass_name, n_events = None, 0
-    if clip_words:
+    if clip_words or hook_text:
         ass_name = f"clip_{plan.index:02d}_{layout}.ass"
-        n_events = build_ass(clip_words, layout, out_dir / ass_name)
+        n_events = build_ass(clip_words, layout, out_dir / ass_name, hook_text)
+    vibe = None
+    if style == "vibe":
+        rel_beats = [b - plan.start for b in (beats or []) if plan.start + 0.05 < b < plan.end - 0.3]
+        vibe = vibe_filters(plan.duration, rel_beats)
     # Run ffmpeg from the session directory with relative paths so the ass filter
     # never has to escape drive letters or spaces (portable across OSes).
     fonts_rel = os.path.relpath(FONTS_DIR, out_dir).replace("\\", "/")
     cmd = [ffmpeg_bin(), "-y", "-hide_banner", "-loglevel", "error",
            "-ss", f"{plan.start:.3f}", "-t", f"{plan.duration:.3f}", "-i", str(src),
-           "-filter_complex", filter_graph(layout, ass_name, fonts_rel),
+           "-filter_complex", filter_graph(layout, ass_name, fonts_rel, vibe, precrop, plan.duration)
+           + (f";[0:a:0]afade=t=in:d=0.04,afade=t=out:st={max(0.0, plan.duration - 0.6):.3f}"
+              f":d=0.6[a]" if has_audio else ""),
            "-map", "[v]"]
     if has_audio:
-        cmd += ["-map", "0:a:0", "-c:a", "aac", "-b:a", "160k", "-ar", "48000"]
+        cmd += ["-map", "[a]", "-c:a", "aac", "-b:a", "192k", "-ar", "48000"]
     cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p",
             "-movflags", "+faststart", out.name]
     run(cmd, cwd=out_dir)
@@ -899,7 +1079,7 @@ def process(args: argparse.Namespace) -> SessionResult:
             # 3. transcript
             words: list[Word] = []
             if args.words_json:
-                words = load_words_json(Path(args.words_json))
+                words = load_words_json(Path(args.words_json), args.min_word_prob)
                 result.transcription = f"provided word timings ({args.words_json})"
             elif has_audio:
                 try:
@@ -913,13 +1093,25 @@ def process(args: argparse.Namespace) -> SessionResult:
                 result.warnings.append("source has no audio track; no subtitles")
                 result.transcription = "no audio"
 
+            precrop = detect_letterbox(src, total)
+            if precrop:
+                log(f"black bars detected, cropping to {precrop.rstrip(',')}")
+
             # 4. choose moments
             min_s, max_s = args.min_seconds, args.max_seconds
             if total and total < min_s * args.count:
                 min_s = max(5.0, total / args.count * 0.8)
                 max_s = max(min_s + 1, total / args.count)
             plans: list[ClipPlan] = []
-            if words and not args.no_llm and llm_available():
+            audio = None
+            if has_audio and (args.mode == "music" or args.style == "vibe"):
+                audio = audio_analysis(src)
+                log(f"audio analysis: {len(audio['beats'])} strong beats detected")
+            if args.mode == "music" and audio is not None:
+                plans = music_select(words, args.count, min_s, max_s, total, audio)
+                result.selection_method = ("music mode: loudness, repeated lyric lines "
+                                           "(chorus/hook), beat density")
+            if not plans and words and not args.no_llm and llm_available():
                 try:
                     plans = llm_select(words, args.count, min_s, max_s, total, result.video_title)
                     result.selection_method = "LLM ranking of transcript"
@@ -944,7 +1136,9 @@ def process(args: argparse.Namespace) -> SessionResult:
                 for layout in layouts:
                     log(f"rendering clip {plan.index:02d} [{layout}] "
                         f"{fmt_ts(plan.start)}-{fmt_ts(plan.end)}")
-                    out, n_events = render_clip(src, plan, layout, words, session, has_audio)
+                    out, n_events = render_clip(
+                        src, plan, layout, words, session, has_audio, style=args.style,
+                        beats=audio["beats"] if audio else None, hook_text=args.hook_text or "", precrop=precrop)
                     rf = RenderedFile(plan.index, layout, str(out), rel(out))
                     verify_file(rf, plan, words, layout)
                     if rf.subtitles_verified is False:
@@ -1011,6 +1205,14 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     p.add_argument("--request", help="original user request, stored in the history")
     p.add_argument("--no-llm", action="store_true", help="never call the configured LLM")
     p.add_argument("--keep-ass", action="store_true", help="keep generated .ass subtitle files")
+    p.add_argument("--mode", choices=["speech", "music"], default="speech",
+                   help="moment selection: speech (talks/podcasts) or music (songs, clips)")
+    p.add_argument("--style", choices=["clean", "vibe"], default="clean",
+                   help="vibe = colour grade, beat-synced zoom pulses, flash-in, fade-out, "
+                        "progress bar")
+    p.add_argument("--hook-text", help="big title shown for the first 2.6 seconds")
+    p.add_argument("--min-word-prob", type=float, default=0.0,
+                   help="drop transcript words below this whisper confidence (lyrics)")
     p.add_argument("--debug", action="store_true")
     args = p.parse_args(list(argv) if argv is not None else None)
     if args.count < 1:
